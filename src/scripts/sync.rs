@@ -11,7 +11,7 @@
 //! each entry on `realm: Option<String>` (Some for AM, None for IDM) so a
 //! same-named script in alpha and bravo never collide.
 
-use super::{Kind, RemoteRef, RemoteScript};
+use super::{Kind, RemoteRef, RemoteScript, validate};
 use crate::config::ProjectConfig;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,9 @@ pub enum PushOutcome {
     Unchanged,
     /// Remote already equals local — snapshot refreshed, no write needed.
     AlreadyInSync,
+    /// Local source failed IDM compile validation; nothing was written. Carries
+    /// the engine's parser message.
+    Invalid(String),
     /// Remote drifted from the snapshot and doesn't match local. Blocked
     /// unless `--force`. Carries the 3-way texts for display.
     Conflict(ThreeWay),
@@ -379,6 +382,29 @@ pub fn preview_source(tenant: &str, c: &Candidate) -> Option<String> {
     None
 }
 
+/// Validate the local workspace source for one synced script.
+pub async fn validate_local(
+    tenant: &str,
+    kind: Kind,
+    realm: &str,
+    name: &str,
+) -> Result<validate::Validation> {
+    let store = SnapshotStore::open(tenant);
+    let entry = store
+        .lookup(kind, name, realm)?
+        .ok_or_else(|| Error::Config(format!("{name:?} not synced yet")))?;
+    let r = &entry.reference;
+    let dest = workspace_file(tenant, realm, r);
+    let local_src = read_local(&dest)?.ok_or_else(|| {
+        Error::Config(format!(
+            "local file {} not found — pull first",
+            dest.display()
+        ))
+    })?;
+
+    validate::validate_idm_source(tenant, &local_src).await
+}
+
 // ---------------------------------------------------------------------------
 // Pull
 // ---------------------------------------------------------------------------
@@ -555,6 +581,14 @@ pub async fn push(
     // remote* config and merge only our edited source, so concurrent metadata
     // changes (description/context/language/exports) aren't reverted by a
     // source-only push.
+    if kind.supports_compile_validation() {
+        if let validate::Validation::Invalid(msg) =
+            validate::validate_idm_source(tenant, &local_src).await?
+        {
+            return Ok(PushOutcome::Invalid(msg));
+        }
+    }
+
     let mut raw = remote.raw_config.clone();
     kind.encode_source(&mut raw, &local_src)?;
     let to_push = RemoteScript {
@@ -690,6 +724,9 @@ pub enum ReconcileOutcome {
     Pulled,
     /// Both sides changed to the same content; snapshot refreshed.
     Converged,
+    /// Local source failed IDM compile validation; nothing was written. Carries
+    /// the engine's parser message.
+    Invalid(String),
     /// Both sides changed differently — the caller resolves.
     Conflict(ThreeWay),
 }
@@ -741,6 +778,14 @@ pub async fn reconcile(
         (true, false) => {
             // Remote == snapshot, so pushing the local edit is safe. Start from
             // the current remote config and merge only the edited source.
+            if kind.supports_compile_validation() {
+                if let validate::Validation::Invalid(msg) =
+                    validate::validate_idm_source(tenant, &local).await?
+                {
+                    return Ok(ReconcileOutcome::Invalid(msg));
+                }
+            }
+
             let mut raw = remote_script.raw_config.clone();
             kind.encode_source(&mut raw, &local)?;
             let to_push = RemoteScript {

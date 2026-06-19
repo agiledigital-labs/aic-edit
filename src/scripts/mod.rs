@@ -25,6 +25,7 @@ pub mod screen;
 pub mod sync;
 pub mod sync_mapping;
 pub mod sync_types;
+pub mod validate;
 pub mod view;
 pub mod workspace;
 
@@ -172,6 +173,14 @@ impl Kind {
     /// snapshot, and manifest on realm without matching on the enum itself.
     pub fn realm_scoped(self) -> bool {
         matches!(self, Kind::Am)
+    }
+
+    /// Whether this kind's source can be pre-flight-validated via the IDM
+    /// `POST /openidm/script?_action=compile` endpoint. All IDM JS kinds can;
+    /// AM scripts use a different engine with no equivalent. See
+    /// `docs/api/11-idm-endpoints.md` "Script validation".
+    pub fn supports_compile_validation(self) -> bool {
+        !matches!(self, Kind::Am)
     }
 
     /// Workspace-relative path of the source file. AM: `am/<realm>/<type>/Foo.cjs`;

@@ -53,6 +53,17 @@ pub enum ScriptCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Validate local synced IDM script source without writing it.
+    ///
+    /// With no <ref> or `all`, validates every synced script. Otherwise <ref>
+    /// is a namespace (`endpoint`, `schedule`, `managed`, `sync`) or one
+    /// script (`endpoint/foo`). AM scripts are reported as skipped.
+    Validate {
+        #[arg(help = "<namespace>/<name>, a namespace, `all`, or empty for everything synced")]
+        reference: Option<String>,
+        #[arg(long, help = "Tenant to target")]
+        tenant: Option<String>,
+    },
     /// Show the sync state of synced scripts. Optional <ref> filters by
     /// namespace (`bravo`, `endpoint`).
     Status {
@@ -279,6 +290,11 @@ pub async fn run(cmd: ScriptCommand) -> Result<()> {
             workspace_update_hint(&t)?;
             Ok(())
         }
+        ScriptCommand::Validate { reference, tenant } => {
+            let t = tenant_for(tenant)?;
+            guard_legacy_workspace(&t)?;
+            validate(&t, reference).await
+        }
         ScriptCommand::Status { reference, tenant } => {
             let t = tenant_for(tenant)?;
             guard_legacy_workspace(&t)?;
@@ -351,6 +367,10 @@ pub async fn run(cmd: ScriptCommand) -> Result<()> {
                         in_sync += 1;
                         println!("= {full}: converged");
                     }
+                    sync::ReconcileOutcome::Invalid(msg) => {
+                        println!("! {full}: won't compile — {msg}");
+                        conflicts.push(full);
+                    }
                     sync::ReconcileOutcome::Conflict(_) => {
                         let choice = match resolve {
                             Some(Resolution::Local) => ConflictChoice::Local,
@@ -359,12 +379,28 @@ pub async fn run(cmd: ScriptCommand) -> Result<()> {
                         };
                         match choice {
                             ConflictChoice::Local => {
-                                prod_hint(
+                                match prod_hint(
                                     sync::push(&t, ns.realm_arg(), c.kind, &c.name, true, yes)
                                         .await,
-                                )?;
-                                pushed += 1;
-                                println!("→ pushed {full} (resolved: local)");
+                                )? {
+                                    sync::PushOutcome::Pushed => {
+                                        pushed += 1;
+                                        println!("→ pushed {full} (resolved: local)");
+                                    }
+                                    sync::PushOutcome::Unchanged
+                                    | sync::PushOutcome::AlreadyInSync => {
+                                        in_sync += 1;
+                                        println!("= {full}: already in sync");
+                                    }
+                                    sync::PushOutcome::Invalid(msg) => {
+                                        println!("! {full}: won't compile — {msg}");
+                                        conflicts.push(full);
+                                    }
+                                    sync::PushOutcome::Conflict(_) => {
+                                        println!("! {full}: remote changed — skipped");
+                                        conflicts.push(full);
+                                    }
+                                }
                             }
                             ConflictChoice::Remote => {
                                 sync::pull(
@@ -842,6 +878,7 @@ async fn watch(tenant: &str, yes: bool) -> Result<()> {
             ) {
                 Ok(PushOutcome::Pushed) => println!("→ pushed {full}"),
                 Ok(PushOutcome::Unchanged | PushOutcome::AlreadyInSync) => {}
+                Ok(PushOutcome::Invalid(msg)) => eprintln!("! {full}: won't compile — {msg}"),
                 Ok(PushOutcome::Conflict(_)) => {
                     eprintln!("! {full}: remote changed — skipped (run `aic script sync {full}`)")
                 }
@@ -849,6 +886,48 @@ async fn watch(tenant: &str, yes: bool) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn validate(tenant: &str, reference: Option<String>) -> Result<()> {
+    let cands = select_synced(script::sync::push_candidates(tenant)?, reference)?;
+    if cands.is_empty() {
+        println!("nothing synced to validate — `aic script pull …` first");
+        return Ok(());
+    }
+
+    let mut passed = 0u32;
+    let mut invalid = 0u32;
+    let mut skipped = 0u32;
+    for c in cands {
+        let full = full_of(&c);
+        if !c.kind.supports_compile_validation() {
+            println!("- {full}: validation is IDM-only, skipped");
+            skipped += 1;
+            continue;
+        }
+        let ns = Namespace {
+            kind: c.kind,
+            realm: c.realm.clone(),
+        };
+        match script::sync::validate_local(tenant, c.kind, ns.realm_arg(), &c.name).await? {
+            script::validate::Validation::Ok => {
+                println!("✓ {full}");
+                passed += 1;
+            }
+            script::validate::Validation::Invalid(msg) => {
+                println!("✗ {full}: {msg}");
+                invalid += 1;
+            }
+        }
+    }
+
+    if invalid > 0 {
+        return Err(Error::Config(format!(
+            "{invalid} script(s) failed validation"
+        )));
+    }
+    println!("validation: {passed} passed, {skipped} skipped");
     Ok(())
 }
 
@@ -908,16 +987,36 @@ async fn push_one(tenant: &str, ns: &Namespace, name: &str, force: bool, yes: bo
         PushOutcome::AlreadyInSync => {
             println!("{full}: remote already matched local; snapshot refreshed")
         }
+        PushOutcome::Invalid(msg) => {
+            eprintln!("{full}: failed validation — {msg}");
+            return Err(Error::Config(format!("{full}: failed validation — {msg}")));
+        }
         // Remote drifted since our last sync — offer to overwrite it.
         PushOutcome::Conflict(tw) => {
             match confirm_overwrite(&format!(
                 "{full} changed on the tenant since you last synced — overwrite the remote?"
             ))? {
                 Some(true) => {
-                    prod_hint(
+                    match prod_hint(
                         script::sync::push(tenant, ns.realm_arg(), ns.kind, name, true, yes).await,
-                    )?;
-                    println!("pushed {full} (overwrote remote changes)");
+                    )? {
+                        PushOutcome::Pushed => println!("pushed {full} (overwrote remote changes)"),
+                        PushOutcome::Unchanged | PushOutcome::AlreadyInSync => {
+                            println!("{full}: remote already matched local; snapshot refreshed")
+                        }
+                        PushOutcome::Invalid(msg) => {
+                            eprintln!("{full}: failed validation — {msg}");
+                            return Err(Error::Config(format!(
+                                "{full}: failed validation — {msg}"
+                            )));
+                        }
+                        PushOutcome::Conflict(_) => {
+                            return Err(Error::Config(
+                                "remote changed since last sync — resolve, or re-run with --force"
+                                    .into(),
+                            ));
+                        }
+                    }
                 }
                 Some(false) => println!("{full}: skipped (remote changed)"),
                 None => {
@@ -958,6 +1057,7 @@ async fn push_all(tenant: &str, force: bool, yes: bool) -> Result<()> {
         )? {
             PushOutcome::Pushed => println!("pushed {full}"),
             PushOutcome::Unchanged | PushOutcome::AlreadyInSync => {}
+            PushOutcome::Invalid(msg) => eprintln!("! {full}: won't compile — {msg}"),
             PushOutcome::Conflict(_) => {
                 println!("{full}: CONFLICT — skipped (`diff {full}`, or `push {full} --force`)")
             }

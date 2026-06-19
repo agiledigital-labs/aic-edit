@@ -151,6 +151,66 @@ annotate with `/** @type {…} */`.
   `scripts/.prettierrc` was added for the standalone template). Consider an
   eslint `comma-dangle: ["error", {"functions": "never"}]` for IDM as a guard.
 
+## Script validation (`POST /openidm/script?_action=compile`)
+
+IDM exposes a **compile/parse** pre-flight that the platform UI uses to validate
+a script before saving it. `aic-edit` runs it before every IDM push so a script
+that won't compile is rejected locally instead of landing broken on the tenant.
+
+| Op | Method | Path | Accept-API-Version | Body |
+|----|--------|------|--------------------|------|
+| Validate | `POST` | `/openidm/script?_action=compile` | none | `{"type":"text/javascript","source":"…"}` |
+
+- **Auth**: service-account bearer works (the HAR capture used a browser cookie
+  session, but the bearer token validates identically — verified 2026-06-19).
+- **Body**: only `type` + `source` are required. `description` and
+  `globalsObject` are accepted but optional (a body with just `type`+`source`
+  returns 200). `source` is **plaintext** (same as the stored IDM `source`).
+- **Success**: `200` with body `true` (a bare JSON boolean, not an object).
+- **Failure**: `400` `{"code":400,"reason":"Bad Request","message":"…"}`. The
+  `message` is the engine's parser error — usually terse (`"syntax error"`) but
+  sometimes specific (`"missing ) after formal parameters"`, `"missing formal
+  parameter"`, `"unterminated string literal"`). For `type:"groovy"` the message
+  is a full multi-line Groovy compiler report with line/column.
+
+### What it catches (and what it doesn't)
+
+It is a **parse/compile** check, not a linter or semantic analyzer. Verified
+2026-06-19 against the live `compile` action:
+
+| Source | Result |
+|--------|--------|
+| `?? ` (nullish coalescing), `?.` (optional chaining) | **400** — Rhino has no ES2020 |
+| default param `function f(a, b=2){}` | **400** `missing ) after formal parameters` |
+| trailing comma in param list `function f(a, b,){}` | **400** `missing formal parameter` |
+| unterminated string / general syntax error | **400** |
+| arrow fn, `let`/`const`, template literals, `for…of` | **200** (Rhino supports these) |
+| reference to an **undefined variable** (valid syntax) | **200** — free vars resolve at runtime, not compile |
+
+So the validator reliably catches the three documented IDM Rhino syntax bans
+(default params, trailing-comma param list, plus `const`-in-for-initializer) and
+unsupported modern operators — exactly the footguns in the "Quirks" list above —
+but it will NOT catch undefined bindings, wrong `openidm.*` usage, or any runtime
+error. Treat a 200 as "it parses", not "it works".
+
+```bash
+# Valid → 200 "true"
+curl -sS -X POST "$TENANT_BASE_URL/openidm/script?_action=compile" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"text/javascript","source":"(function(){ return {}; })();"}'
+
+# Invalid → 400 {"code":400,…,"message":"syntax error"}
+curl -sS -X POST "$TENANT_BASE_URL/openidm/script?_action=compile" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"type":"text/javascript","source":"(function(){ var x = ; })();"}'
+```
+
+> The same endpoint serves every IDM script kind (endpoints, schedules,
+> managed-object hooks, sync-mapping transforms) — the engine only sees a
+> `type`+`source` pair, not where the script came from. AM scripts have **no**
+> equivalent here (different engine, base64 body, realm-scoped); this validation
+> is IDM-only.
+
 ## Scheduled jobs (`schedule/<name>`)
 
 IDM scheduled jobs are config objects at `/openidm/config/schedule/<name>` —
@@ -191,6 +251,10 @@ Object shape (real example, `schedule/UpdateReviewList`):
 
 ## Verified against
 - Tenant: `<your-tenant>.forgeblocks.com`
+- Date: 2026-06-19 (`POST /openidm/script?_action=compile`: 200 `true` on valid
+  JS; 400 `{message}` on `??`/`?.`, default params, trailing-comma param list,
+  unterminated string; 200 on undefined-var reference, confirming parse-only;
+  body needs only `type`+`source`; bearer auth works).
 - Date: 2026-06-01 (CRUD); 2026-06-04 (`request`/`context` runtime shapes per
   method, via `endpoint/rhino-probe` echo — created, probed read/create/update/
   patch/delete/action/query, deleted)

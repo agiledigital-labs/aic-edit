@@ -464,6 +464,7 @@ pub fn execute_push(
                 PushOutcome::Pushed => Ok(format!("pushed {full}")),
                 PushOutcome::Unchanged => Ok(format!("{full}: no local changes")),
                 PushOutcome::AlreadyInSync => Ok(format!("{full}: already in sync")),
+                PushOutcome::Invalid(msg) => Err(format!("{full}: won't compile — {msg}")),
                 PushOutcome::Conflict(_) => Err(format!(
                     "{full}: remote changed since last pull — resolve with `aic script diff {full}`"
                 )),
