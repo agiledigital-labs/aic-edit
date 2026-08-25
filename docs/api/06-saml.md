@@ -272,20 +272,20 @@ fingerprint that distinguishes a `cotlist` problem from anything else:
 **Succeeding** — AM resolves a CoT _by name_ out of the entity's `cotlist`:
 
 ```
-SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://sp-a.example.com
+SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://uat.client-a…
 ConfigurationInstanceImpl.getAllConfigurationNames: realm = /bravo, componentName = LIBCOT
 COTCache:getCircleOfTrust:cacheKey = /bravo//client-a, found = false
 ConfigurationInstanceImpl.getConfiguration: componentName = LIBCOT, realm = /bravo, configName = client-a
 COTUtils.setToPrototolMap: check https://sts.windows.net/<tenant-guid>/|saml2
-COTUtils.setToPrototolMap: check https://sp-a.example.com|saml2
+COTUtils.setToPrototolMap: check https://uat.client-a…|saml2
 SAML2Utils.verifyResponse:binding is :urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST
 ```
 
 **Failing** — the same entity-config read, then **no `LIBCOT` lookup at all**:
 
 ```
-SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://sp-b.example.com
-SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://sp-b.example.com
+SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://uat.client-b…
+SAML2MetaManager.getEntityConfig: got entity config from SAML2MetaCache: https://uat.client-b…
 SAML2Utils.verifyResponse:Issuer in Response is not valid.
 ```
 
